@@ -6,6 +6,7 @@ Adds deployment-safe defaults around the upstream MCP implementation:
 - exposes an unauthenticated /health endpoint
 - hides paid QWeather tropical-cyclone tools by default
 - suppresses upstream INFO logs during import so API key prefixes are not logged
+- stays alive with a diagnostic health endpoint when deployment config is incomplete
 """
 
 from __future__ import annotations
@@ -16,21 +17,13 @@ import os
 from typing import Iterable
 
 import uvicorn
+from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-# The upstream module logs the first 10 characters of HEFENG_API_KEY at import time.
-# Keep credentials unchanged, but suppress INFO output just for that import.
-_previous_disable_level = logging.root.manager.disable
-logging.disable(logging.INFO)
-try:
-    from . import main as upstream
-finally:
-    logging.disable(_previous_disable_level)
-
 logger = logging.getLogger("hefeng_qweather_mcp.cloud")
-mcp = upstream.mcp
 
 _PAID_TOOL_NAMES = {
     "get_storm_list",
@@ -46,7 +39,87 @@ def _env_true(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _hide_tools(tool_names: Iterable[str]) -> list[str]:
+def _deployment_config_errors() -> list[str]:
+    """Return human-readable deployment configuration problems without secrets."""
+
+    errors: list[str] = []
+
+    if not os.environ.get("HEFENG_API_HOST", "").strip():
+        errors.append("HEFENG_API_HOST is missing")
+
+    api_key = os.environ.get("HEFENG_API_KEY", "").strip()
+    if not api_key:
+        project_id = os.environ.get("HEFENG_PROJECT_ID", "").strip()
+        key_id = os.environ.get("HEFENG_KEY_ID", "").strip()
+        private_key = os.environ.get("HEFENG_PRIVATE_KEY", "").strip()
+        private_key_path = os.environ.get("HEFENG_PRIVATE_KEY_PATH", "").strip()
+        if not (project_id and key_id and (private_key or private_key_path)):
+            errors.append("HEFENG_API_KEY is missing (or JWT credentials are incomplete)")
+
+    token = os.environ.get("MCP_ACCESS_TOKEN", "").strip()
+    if len(token) < 24:
+        errors.append("MCP_ACCESS_TOKEN must be at least 24 characters")
+
+    return errors
+
+
+def _host_port() -> tuple[str, int]:
+    host = os.environ.get("HOST", "0.0.0.0")
+    try:
+        port = int(os.environ.get("PORT", "8000"))
+    except ValueError:
+        port = 8000
+        logger.error("Invalid PORT value; falling back to 8000")
+    return host, port
+
+
+def _diagnostic_app(errors: list[str], status_code: int = 503) -> Starlette:
+    """Serve a stable diagnostic endpoint instead of entering a restart loop."""
+
+    async def health(_: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "status": "misconfigured" if status_code == 503 else "startup_error",
+                "service": "hefeng-qweather-mcp",
+                "errors": errors,
+            },
+            status_code=status_code,
+        )
+
+    async def unavailable(_: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": "service_unavailable",
+                "details": errors,
+            },
+            status_code=status_code,
+        )
+
+    return Starlette(
+        routes=[
+            Route("/health", endpoint=health, methods=["GET"]),
+            Route(
+                "/{path:path}",
+                endpoint=unavailable,
+                methods=["GET", "POST", "DELETE", "OPTIONS"],
+            ),
+        ]
+    )
+
+
+def _load_upstream():
+    """Import upstream while preventing its API-key-prefix INFO log from escaping."""
+
+    previous_disable_level = logging.root.manager.disable
+    logging.disable(logging.INFO)
+    try:
+        from . import main as upstream
+    finally:
+        logging.disable(previous_disable_level)
+    return upstream
+
+
+def _hide_tools(mcp, tool_names: Iterable[str]) -> list[str]:
     """Remove selected tools from FastMCP's registered tool table.
 
     FastMCP v1 does not expose a public remove_tool() API. This adapter therefore
@@ -66,17 +139,6 @@ def _hide_tools(tool_names: Iterable[str]) -> list[str]:
         if tools.pop(name, None) is not None:
             removed.append(name)
     return removed
-
-
-if not _env_true("ENABLE_PAID_WEATHER_TOOLS", default=False):
-    removed = _hide_tools(_PAID_TOOL_NAMES)
-    if removed:
-        logger.info("Paid QWeather tools disabled: %s", ", ".join(sorted(removed)))
-
-
-@mcp.custom_route("/health", methods=["GET"])
-async def health(_: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok", "service": "hefeng-qweather-mcp"})
 
 
 class StaticBearerAuthMiddleware:
@@ -122,26 +184,39 @@ class StaticBearerAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-def main() -> None:
-    token = os.environ.get("MCP_ACCESS_TOKEN", "").strip()
-    if len(token) < 24:
-        raise RuntimeError(
-            "MCP_ACCESS_TOKEN must be set to a random secret of at least 24 characters"
+def _build_app() -> ASGIApp:
+    config_errors = _deployment_config_errors()
+    if config_errors:
+        logger.error("Deployment configuration incomplete: %s", "; ".join(config_errors))
+        return _diagnostic_app(config_errors)
+
+    try:
+        upstream = _load_upstream()
+        mcp = upstream.mcp
+
+        if not _env_true("ENABLE_PAID_WEATHER_TOOLS", default=False):
+            removed = _hide_tools(mcp, _PAID_TOOL_NAMES)
+            if removed:
+                logger.info("Paid QWeather tools disabled: %s", ", ".join(sorted(removed)))
+
+        @mcp.custom_route("/health", methods=["GET"])
+        async def health(_: Request) -> JSONResponse:
+            return JSONResponse({"status": "ok", "service": "hefeng-qweather-mcp"})
+
+        token = os.environ["MCP_ACCESS_TOKEN"].strip()
+        return StaticBearerAuthMiddleware(mcp.streamable_http_app(), token)
+    except Exception as exc:  # keep the container alive so /health can reveal startup state
+        logger.exception("Failed to initialize QWeather MCP")
+        return _diagnostic_app(
+            [f"MCP initialization failed: {type(exc).__name__}; check service logs"],
+            status_code=500,
         )
 
-    host = os.environ.get("HOST", "0.0.0.0")
-    try:
-        port = int(os.environ.get("PORT", "8000"))
-    except ValueError as exc:
-        raise RuntimeError("PORT must be an integer") from exc
 
-    app = StaticBearerAuthMiddleware(mcp.streamable_http_app(), token)
-
-    logger.info(
-        "Starting private Streamable HTTP MCP on %s:%s (endpoint /mcp, health /health)",
-        host,
-        port,
-    )
+def main() -> None:
+    host, port = _host_port()
+    app = _build_app()
+    logger.info("Starting cloud service on %s:%s", host, port)
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
