@@ -206,10 +206,10 @@ def _build_app() -> ASGIApp:
             return JSONResponse({"status": "ok", "service": "hefeng-qweather-mcp"})
 
         token = os.environ["MCP_ACCESS_TOKEN"].strip()
-        transport_security = TransportSecuritySettings(
+        mcp.settings.transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=False
         )
-        mcp_app = mcp.streamable_http_app(transport_security=transport_security)
+        mcp_app = mcp.streamable_http_app()
         return StaticBearerAuthMiddleware(mcp_app, token)
     except Exception as exc:  # keep the container alive so /health can reveal startup state
         logger.exception("Failed to initialize QWeather MCP")
