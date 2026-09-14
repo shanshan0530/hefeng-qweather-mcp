@@ -10,6 +10,6 @@ COPY src ./src
 
 RUN pip install --no-cache-dir .
 
-EXPOSE 8000
+EXPOSE 8080
 
 CMD ["python", "-m", "hefeng_qweather_mcp.cloud"]
