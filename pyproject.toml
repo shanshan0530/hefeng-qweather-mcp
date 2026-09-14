@@ -23,7 +23,7 @@ requires-python = ">=3.11"
 dependencies = [
     "cryptography>=41.0.0",
     "httpx>=0.25.0",
-    "mcp[cli]>=1.10.0",
+    "mcp[cli]>=1.10.0,<2.0.0",
     "pyjwt>=2.8.0",
     "python-dotenv>=1.0.0",
     "typer>=0.12.0",
@@ -37,6 +37,7 @@ Documentation = "https://github.com/fengyucn/hefeng-qweather-mcp#readme"
 
 [project.scripts]
 hefeng-qweather-mcp = "hefeng_qweather_mcp.main:main"
+hefeng-qweather-mcp-cloud = "hefeng_qweather_mcp.cloud:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
