@@ -66,10 +66,10 @@ def _deployment_config_errors() -> list[str]:
 def _host_port() -> tuple[str, int]:
     host = os.environ.get("HOST", "0.0.0.0")
     try:
-        port = int(os.environ.get("PORT", "8000"))
+        port = int(os.environ.get("PORT", "8080"))
     except ValueError:
-        port = 8000
-        logger.error("Invalid PORT value; falling back to 8000")
+        port = 8080
+        logger.error("Invalid PORT value; falling back to 8080")
     return host, port
 
 
