@@ -7,6 +7,7 @@ Adds deployment-safe defaults around the upstream MCP implementation:
 - hides paid QWeather tropical-cyclone tools by default
 - suppresses upstream INFO logs during import so API key prefixes are not logged
 - stays alive with a diagnostic health endpoint when deployment config is incomplete
+- disables FastMCP DNS-rebinding Host checks behind the Zeabur reverse proxy
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import os
 from typing import Iterable
 
 import uvicorn
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -204,7 +206,11 @@ def _build_app() -> ASGIApp:
             return JSONResponse({"status": "ok", "service": "hefeng-qweather-mcp"})
 
         token = os.environ["MCP_ACCESS_TOKEN"].strip()
-        return StaticBearerAuthMiddleware(mcp.streamable_http_app(), token)
+        transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        )
+        mcp_app = mcp.streamable_http_app(transport_security=transport_security)
+        return StaticBearerAuthMiddleware(mcp_app, token)
     except Exception as exc:  # keep the container alive so /health can reveal startup state
         logger.exception("Failed to initialize QWeather MCP")
         return _diagnostic_app(
